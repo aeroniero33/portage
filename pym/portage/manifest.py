@@ -26,7 +26,7 @@ from portage import _unicode_encode
 from portage.exception import DigestException, FileNotFound, \
 	InvalidDataType, MissingParameter, PermissionDenied, \
 	PortageException, PortagePackageException
-from portage.const import (MANIFEST1_HASH_FUNCTIONS, MANIFEST2_HASH_DEFAULTS,
+from const import (MANIFEST1_HASH_FUNCTIONS, MANIFEST2_HASH_DEFAULTS,
 	MANIFEST2_HASH_FUNCTIONS, MANIFEST2_IDENTIFIERS, MANIFEST2_REQUIRED_HASH)
 from portage.localization import _
 
@@ -57,7 +57,7 @@ def manifest2AuxfileFilter(filename):
 def manifest2MiscfileFilter(filename):
 	return not (filename == "Manifest" or filename.endswith(".ebuild"))
 
-def guessManifestFileType(filename):
+def guessManifestFileType(filename, is_pkg = True):
 	""" Perform a best effort guess of which type the given filename is, avoid using this if possible """
 	if filename.startswith("files" + os.sep + "digest-"):
 		return None
@@ -65,10 +65,18 @@ def guessManifestFileType(filename):
 		return "AUX"
 	elif filename.endswith(".ebuild"):
 		return "EBUILD"
+	elif filename == "Manifest":
+		return "MANIFEST"
+	elif filename.endswith(".eclass"):
+		return "ECLASS"
 	elif filename in ["ChangeLog", "metadata.xml"]:
 		return "MISC"
-	else:
+	elif filename.endswith(".sh"):
+		return "EXEC"
+	elif is_pkg:
 		return "DIST"
+	else:
+		return "OTHER"
 
 def guessThinManifestFileType(filename):
 	type = guessManifestFileType(filename)
@@ -449,6 +457,7 @@ class Manifest(object):
 		distfiles to raise a FileNotFound exception for (if no file or existing
 		checksums are available), and defaults to all distfiles when not
 		specified."""
+
 		if not self.allow_create:
 			return
 		if checkExisting:
@@ -588,6 +597,7 @@ class Manifest(object):
 
 	def _getAbsname(self, ftype, fname):
 		if ftype == "DIST":
+			print(self.distdir,8)
 			absname = os.path.join(self.distdir, fname)
 		elif ftype == "AUX":
 			absname = os.path.join(self.pkgdir, "files", fname)

@@ -19,10 +19,16 @@ portage.proxy.lazyimport.lazyimport(globals(),
         'portage.util:write_atomic,writemsg_level',
 )
 
+from gkeys.gkeysinterface import GkeysInterface
+from gkeys.config import GKeysConfig
+from pyGPG.gpg import GPG
+from gkeys.lib import GkeysGPG
+
 from portage import os
 from portage import _encodings
 from portage import _unicode_decode
 from portage import _unicode_encode
+from manifest import guessManifestFileType
 import manifest
 from portage.exception import DigestException, FileNotFound, \
         InvalidDataType, MissingParameter, PermissionDenied, \
@@ -38,30 +44,9 @@ if sys.hexversion >= 0x3000000:
 else:
 	_unicode = unicode
 
-def guessManifestFileType(filename):
-        """ Perform a best effort guess of which type the given filename is, avoid using this if possible """
-        if filename.startswith("files" + os.sep + "digest-"):
-                return None
-        elif filename.startswith("files" + os.sep):
-                return "AUX"
-        elif filename.endswith(".ebuild"):
-                return "EBUILD"
-        elif filename == "Manifest" or filename == "MetaManifest":
-                return "MANIFEST"
-        elif filename.endswith(".eclass"):
-                return "ECLASS"
-        elif filename in ["ChangeLog", "metadata.xml"]:
-                return "MISC"
-        elif filename.endswith(".sh"):
-	        return "EXEC"
-        else:
-                return "OTHER"
 
 class MetaManifest(manifest.Manifest):
 
-	def getFullname(self):
-                """ Returns the absolute path to the Manifest file for this instance """
-                return os.path.join(self.pkgdir, "MetaManifest")
 
 	def sign(self):
 		'''Signs MetaManifest file with the default PORTAGE_GPG_KEY''' 
@@ -97,15 +82,72 @@ class MetaManifest(manifest.Manifest):
 		else:
 			raise portage.exception.PortageException("!!! gpg exited with '" + str(return_code) + "' status")
 
+	def find_reporoot(self):
+		'''Finds reporoot'''
+		repodir = self.pkgdir
+		while len(set(['metadata', 'eclass', 'profiles']).intersection(os.listdir(repodir))) == 0:
+			myrepo = repodir.split(os.path.sep)[1:-1]
+			if myrepo[-1] not in myrepo[:-1]:
+				repodir = repodir.replace(("/" +  myrepo[-1]), "")
+			else:
+				raise("Invalid path")
+		self.reporoot = repodir
+
+	def find_repolevel(self, path):
+		'''Finds repolevel'''
+		self.find_reporoot()
+		path = path.replace(self.reporoot, "")
+		myrepo = path.split(os.path.sep)
+		repolevel = len(myrepo)
+		return repolevel
+
+	def find_repotype(self, path):
+		'''Finds the type of the repo directory'''
+		if len(set(['metadata', 'eclass', 'profiles']).intersection(os.listdir(path))) > 0:
+			return 'root'
+		elif path.endswith("eclass/"):
+			return 'eclass'
+		elif path.endswith("profiles/"):
+			return 'profile'
+		else:
+			if self.find_repolevel(path) == 2:
+				return 'category'
+			else:
+				return 'package'
+
 	def create(self):
 		'''Creates a MetaManifest file'''
-		dir = self.pkgdir
-		if dir.endswith("profiles/"):
+		repodir = self.pkgdir
+		repotype = self.find_repotype(repodir)
+		if repotype == 'profile':
 			self.create_profile()
-		elif dir.endswith("eclass/"):
+		elif repotype == 'eclass':
 			self.create_eclass()
+		elif repotype == 'root':
+			self.create_master()
 		else:
 			self.create_cat()
+
+	def create_master(self):
+		'''Creates a MetaManifest file from all the MetaManifest files of the repository'''
+		self.find_reporoot()
+		myrepodir = self.reporoot
+		self.pkgdir = self.reporoot
+		self.fhashdict = {}
+		for ftype in MANIFEST2_IDENTIFIERS:
+			self.fhashdict[ftype] = {}
+		for f in os.listdir(myrepodir):
+			fpath = os.path.join(myrepodir, f)
+			if os.path.isfile(fpath):
+				if not fpath.endswith('Manifest'):
+					ftype = guessManifestFileType(fpath, is_pkg=False)
+					self.fhashdict[ftype][f] = perform_multiple_checksums(fpath, self.hashes)
+			else:
+				for mf in os.listdir(fpath):
+					mfpath = os.path.join(fpath, mf)
+					if mfpath.endswith('Manifest'):
+						f = mfpath.replace(self.reporoot, "")
+						self.fhashdict["MANIFEST"][f] = perform_multiple_checksums(mfpath, self.hashes) 
 
 	def create_eclass(self):
 		'''Creates a MetaManifest file in the eclass directory'''
@@ -115,7 +157,6 @@ class MetaManifest(manifest.Manifest):
 			self.fhashdict[ftype] = {}
 
 		for eclass_dir, eclassdir_dir, files in os.walk(eclass_dir):
-			print(eclass_dir, eclassdir_dir, files)
 			for f in files:
 				try:
                                         f = _unicode_decode(f,encoding=_encodings['fs'], errors='strict')
@@ -123,28 +164,27 @@ class MetaManifest(manifest.Manifest):
 				except UnicodeDecodeError:
                         	        continue
 				fpath = os.path.join(eclass_dir, f)
-				ftype = guessManifestFileType(fpath)
+				ftype = guessManifestFileType(fpath, is_pkg=False)
 				f = fpath.replace(self.pkgdir, "")
-				if not f.endswith("MetaManifest"):
+				if not f.endswith("Manifest"):
 					self.fhashdict[ftype][f] = perform_multiple_checksums(fpath, self.hashes)
-		print(self.fhashdict, 10)
 
 	def create_cat(self):
 		'''Creates a MetaManifest file in the selected category'''
 		catdir = self.pkgdir
-		self.fhashdict = {}
-		self.fhashdict["MANIFEST"] = {}
-		for catdir, catdir_dir, pkg_files in os.walk(catdir):
-			for f in pkg_files:
-				try:
-					f = _unicode_decode(f,encoding=_encodings['fs'], errors='strict')
-					catdir = _unicode_decode(catdir,encoding=_encodings['fs'], errors='strict')
-				except UnicodeDecodeError:
-					continue
-				if f == "Manifest" :
-					fpath = os.path.join(catdir, f)
-					f = fpath.replace(self.pkgdir, "")
-					self.fhashdict["MANIFEST"][f] = perform_multiple_checksums(fpath, self.hashes) 
+		for ftype in MANIFEST2_IDENTIFIERS:
+                        self.fhashdict[ftype] = {}
+		for pkg_dir in os.listdir(catdir):
+			pkg_dir = os.path.join(catdir, pkg_dir)
+			if os.path.isdir(pkg_dir):
+				for file in os.listdir(pkg_dir):
+					fpath = os.path.join(pkg_dir, file)
+					if os.path.isfile(fpath) and fpath.endswith('Manifest'):
+						new_mf = MetaManifest(fpath.replace('Manifest', ""))
+						new_mf.verify_manifest()
+						f = fpath.replace(self.pkgdir, "")
+						self.fhashdict["MANIFEST"][f] = perform_multiple_checksums(fpath, self.hashes)
+
 	def create_profile(self):
 		'''Creates a MetaManifest file in the profiles directory'''
 		profiledir = self.pkgdir
@@ -158,14 +198,66 @@ class MetaManifest(manifest.Manifest):
 				except UnicodeDecodeError:
 					continue
 				fpath = os.path.join(profiledir, f)
-				ftype = guessManifestFileType(fpath)
+				ftype = guessManifestFileType(fpath, is_pkg=False)
 				if ftype == "OTHER":
 					ftype = "DATA"
 				f = fpath.replace(self.pkgdir, "")
-				if not f.endswith("MetaManifest"):
+				if not f.endswith("Manifest"):
 					self.fhashdict[ftype][f] = perform_multiple_checksums(fpath, self.hashes)
 
+	def checkFileHashes(self, ftype, fname, ignoreMissing=False, hash_filter=None):
+                digests = _filter_unaccelarated_hashes(self.fhashdict[ftype][fname])
+                if hash_filter is not None:
+                        digests = _apply_hash_filter(digests, hash_filter)
+                try:
+                        if ftype not in ('DIST'):
+                                ok, reason = verify_all(self._getAbsname(ftype, fname), digests)
+                                if not ok:
+                                        raise DigestException(tuple([self._getAbsname(ftype, fname)]+list(reason)))
+                                return ok, reason
+                except FileNotFound as e:
+                        if not ignoreMissing:
+                                raise
+                        return False, _("File Not Found: '%s'") % str(e)
 
+
+	def validate_signature(self):
+		'''Validate the Manifest's file signature.'''
+		self.gkeys = GkeysInterface('portage', '/')
+		is_good, has_sig = self.gkeys.verify_file(self.getFullname())
+		return (is_good, has_sig)
+
+	def verify_manifest(self, verify_pkgs = True):
+		'''Verifies the manifest's validity'''
+		mfdir = self.pkgdir
+		mftype = self.find_repotype(mfdir)
+		print(mftype)
+		if mftype == 'root':
+			for ftype in MANIFEST2_IDENTIFIERS:
+				for f in self.fhashdict[ftype]:
+					if ftype != 'MANIFEST':
+						self.checkFileHashes(ftype, f, ignoreMissing=False)
+					else:
+						mfpath = os.path.join(mfdir, f.replace("Manifest", ""))
+						if not os.path.exists(mfpath) and self.find_repotype(f) is 'category':
+							self.checkFileHashes('MANIFEST', f, ignoreMissing=True)
+						else:
+							self.checkFileHashes('MANIFEST', f, ignoreMissing=False)
+						new_mf = MetaManifest(mfpath)
+						new_mf.verify_manifest(verify_pkgs=verify_pkgs)
+		elif mftype == 'category':
+			for f in self.fhashdict['MANIFEST']:
+				mfpath = os.path.join(mfdir, f.replace("Manifest", ""))
+				if not os.path.exists(mfpath) and self.find_repotype(f) is 'package':
+					self.checkFileHashes('MANIFEST', f, ignoreMissing=True)
+				else:
+					self.checkFileHashes('MANIFEST', f, ignoreMissing=False)
+				if verify_pkgs:
+					new_mfpath = os.path.join(mfdir, f.replace("Manifest", ""))
+					new_mf = MetaManifest(new_mfpath)
+					new_mf.verify_manifest(verify_pkgs=verify_pkgs)
+		else:
+			self.checkAllHashes(ignoreMissingFiles=False)
 
 if __name__ == '__main__':
 	try:
@@ -177,7 +269,7 @@ if __name__ == '__main__':
 		meta_manifest = MetaManifest(args.directory)
 		meta_manifest.create()
 		meta_manifest.write(sign=True)
-
+		#meta_manifest.verify_manifest(verify_pkgs=True)
 	except KeyboardInterrupt:
 		print('interrupted ...', file=sys.stderr)
 		exit(1)
